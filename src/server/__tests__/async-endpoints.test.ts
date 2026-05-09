@@ -563,6 +563,63 @@ describe('bridge async protocol endpoints', () => {
 		await expect(store.listReadyJobs(10)).resolves.toHaveLength(2);
 	});
 
+	it('uses the readiness freshness floor when wait-ready schedules heartbeat work', async () => {
+		process.env.AUTH_TOKEN = 'readiness-token';
+		const store = createInMemoryBridgeAsyncStore();
+		await store.upsertAvailabilitySnapshot({
+			kind: 'dates',
+			serviceId: service.id,
+			scope: '2026-06',
+			adapterProfile: {
+				backend: 'acuity',
+				baseUrl: 'https://example.as.me',
+			},
+			value: [{ date: '2026-06-15' }],
+			observedAt: '2000-01-01T00:00:00.000Z',
+			staleAt: '2999-01-01T00:05:00.000Z',
+			expiresAt: '2999-01-01T00:30:00.000Z',
+		});
+		const running = await listen(store);
+		activeServer = running.server;
+
+		const response = await fetch(
+			`${running.baseUrl}/internal/availability/wait-ready`,
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer readiness-token',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					demands: [{ serviceId: service.id, months: ['2026-06'] }],
+					maxJobs: 1,
+					timeoutMs: 1,
+					pollMs: 1,
+					snapshotFreshnessFloorMs: 90_000,
+					idempotencyKeyPrefix: 'test-readiness-floor',
+				}),
+			},
+		);
+		const body = await response.json();
+
+		expect(response.status).toBe(409);
+		expect(body.data.heartbeat.enqueued).toMatchObject([
+			{
+				action: expect.stringMatching(/^(queued|deduped)$/),
+				kind: 'dates',
+				serviceId: service.id,
+				scope: '2026-06',
+				freshness: 'stale',
+			},
+		]);
+		await expect(store.listReadyJobs(10)).resolves.toMatchObject([
+			{
+				kind: 'availability_dates_refresh',
+				status: 'queued',
+			},
+		]);
+	});
+
 	it('auth-gates the internal snapshot canary and records durable snapshot layer metrics', async () => {
 		process.env.AUTH_TOKEN = 'canary-token';
 		const store = createInMemoryBridgeAsyncStore();
@@ -801,16 +858,28 @@ describe('bridge async protocol endpoints', () => {
 		const second = await secondResponse.json();
 
 		expect(secondResponse.status).toBe(202);
-		expect(
-			second.data.enqueued.map(
-				(job: { operationId: string }) => job.operationId,
-			),
-		).toEqual(
-			first.data.enqueued.map(
-				(job: { operationId: string }) => job.operationId,
-			),
+		expect(second.data.enqueued).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					operationId: first.data.enqueued[0].operationId,
+					action: 'deduped',
+					kind: 'dates',
+					scope: '2026-07',
+				}),
+				expect.objectContaining({
+					operationId: first.data.enqueued[1].operationId,
+					action: 'deduped',
+					kind: 'slots',
+					scope: '2026-06-15',
+				}),
+				expect.objectContaining({
+					action: 'queued',
+					kind: 'dates',
+					scope: '2026-08',
+				}),
+			]),
 		);
-		await expect(store.listReadyJobs(10)).resolves.toHaveLength(2);
+		await expect(store.listReadyJobs(10)).resolves.toHaveLength(3);
 	});
 
 	it('requeues retryable heartbeat idempotency hits instead of reporting failed records as enqueued', async () => {
