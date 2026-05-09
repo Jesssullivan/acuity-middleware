@@ -2053,6 +2053,7 @@ const runAvailabilityHeartbeat = async (
 		readonly maxJobs: number;
 		readonly idempotencyWindowMs: number;
 		readonly idempotencyKeyPrefix?: string;
+		readonly snapshotFreshnessFloorMs?: number;
 		readonly context: RequestContext;
 	},
 ): Promise<AvailabilityHeartbeatResponse> => {
@@ -2063,6 +2064,7 @@ const runAvailabilityHeartbeat = async (
 		options.idempotencyKeyPrefix ?? 'availability-heartbeat';
 	const enqueued: AvailabilityHeartbeatJob[] = [];
 	const skipped: AvailabilityHeartbeatSkipped[] = [];
+	let submittedJobs = 0;
 
 	for (const candidate of candidates) {
 		const snapshot = await bridgeAsyncStore.getAvailabilitySnapshot({
@@ -2072,7 +2074,13 @@ const runAvailabilityHeartbeat = async (
 			baseUrl: ACUITY_BASE_URL,
 		});
 		const freshness = snapshot
-			? classifyAvailabilitySnapshotFreshness(snapshot)
+			? options.snapshotFreshnessFloorMs === undefined
+				? classifyAvailabilitySnapshotFreshness(snapshot)
+				: classifyAvailabilityReadinessFreshness(
+						snapshot,
+						new Date(),
+						options.snapshotFreshnessFloorMs,
+					)
 			: 'missing';
 
 		if (freshness === 'fresh') {
@@ -2088,7 +2096,7 @@ const runAvailabilityHeartbeat = async (
 			continue;
 		}
 
-		if (enqueued.length >= options.maxJobs) {
+		if (submittedJobs >= options.maxJobs) {
 			recordAvailabilityHeartbeatJob(candidate.kind, 'skipped_limit');
 			skipped.push({
 				kind: candidate.kind,
@@ -2128,8 +2136,10 @@ const runAvailabilityHeartbeat = async (
 			candidate.scope,
 			idempotencyBucket,
 		].join(':');
+		const enqueueStartedAt = Date.now();
 		let record = await bridgeAsyncStore.enqueueJob(job, { idempotencyKey });
-		let action: AvailabilityHeartbeatJob['action'] = 'queued';
+		let action: AvailabilityHeartbeatJob['action'] =
+			Date.parse(record.createdAt) < enqueueStartedAt ? 'deduped' : 'queued';
 		if (isRetryableHeartbeatFailure(record)) {
 			const requeued = await bridgeAsyncStore.requeueJob(record.operationId);
 			if (!requeued) {
@@ -2148,6 +2158,9 @@ const runAvailabilityHeartbeat = async (
 			}
 			record = requeued;
 			action = 'requeued';
+		}
+		if (action !== 'deduped') {
+			submittedJobs += 1;
 		}
 		if (!heartbeatRunnableStatuses.has(record.status)) {
 			recordAvailabilityHeartbeatJob(candidate.kind, 'skipped_terminal');
@@ -2332,10 +2345,11 @@ const handleAvailabilityWaitReady = async (
 	const startedAt = Date.now();
 	let attempts = 0;
 
-	const heartbeat = await runAvailabilityHeartbeat(parsed.candidates, {
+	let heartbeat = await runAvailabilityHeartbeat(parsed.candidates, {
 		maxJobs,
 		idempotencyWindowMs,
 		idempotencyKeyPrefix,
+		snapshotFreshnessFloorMs: policy.snapshotFreshnessFloorMs,
 		context,
 	});
 	let readiness = await evaluateAvailabilityReadiness(
@@ -2347,6 +2361,13 @@ const handleAvailabilityWaitReady = async (
 		await wait(
 			Math.min(pollMs, Math.max(0, timeoutMs - (Date.now() - startedAt))),
 		);
+		heartbeat = await runAvailabilityHeartbeat(parsed.candidates, {
+			maxJobs,
+			idempotencyWindowMs,
+			idempotencyKeyPrefix,
+			snapshotFreshnessFloorMs: policy.snapshotFreshnessFloorMs,
+			context,
+		});
 		readiness = await evaluateAvailabilityReadiness(parsed.candidates, policy);
 		attempts += 1;
 	}
