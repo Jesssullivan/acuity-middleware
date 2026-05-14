@@ -46,6 +46,8 @@ export interface TimeSelectionEntry {
 	readonly disabled: boolean;
 }
 
+type AvailabilitySurface = 'calendar' | 'time-list';
+
 const DEFAULT_URL_READ_NETWORK_IDLE_MS = 1500;
 const DEFAULT_EMPTY_DATE_SETTLE_MS = 2500;
 const DEFAULT_MORE_TIMES_CLICKS = 8;
@@ -305,6 +307,34 @@ const navigateToServiceCalendar = (
 		catch: (e) => new WizardStepError({ step, message: `Navigation failed: ${e}` }),
 	});
 
+const waitForAvailabilitySurface = (
+	page: Page,
+	timeout: number,
+	step: 'read-availability' | 'read-slots',
+): Effect.Effect<AvailabilitySurface, WizardStepError> =>
+	Effect.tryPromise({
+		try: async () => {
+			const waitMs = Math.min(timeout, 10_000);
+			const calendarSelector = Selectors.calendar.join(', ');
+			const timeListSelector = Selectors.timeSlot.join(', ');
+			const surfaceSelector = `${calendarSelector}, ${timeListSelector}`;
+
+			await page.waitForSelector(surfaceSelector, { timeout: waitMs });
+
+			const calendar = await page.$(calendarSelector).catch(() => null);
+			if (calendar) return 'calendar' as const;
+
+			const timeList = await page.$(timeListSelector).catch(() => null);
+			if (timeList) return 'time-list' as const;
+
+			throw new Error('No known Acuity availability surface matched');
+		},
+		catch: () => new WizardStepError({
+			step,
+			message: 'Availability surface did not load within timeout',
+		}),
+	});
+
 const navigateToTargetMonth = (
 	page: Page,
 	targetMonth: string | undefined,
@@ -406,17 +436,24 @@ export const readDatesViaUrl = (
 		url.searchParams.set('appointmentType', serviceId);
 
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-availability');
-		yield* navigateToTargetMonth(page, targetMonth, 'read-availability');
+		const surface = yield* waitForAvailabilitySurface(
+			page,
+			config.timeout,
+			'read-availability',
+		);
+		if (surface === 'calendar') {
+			yield* navigateToTargetMonth(page, targetMonth, 'read-availability');
+		} else if (targetMonth && !parseYearMonthKey(targetMonth)) {
+			return yield* Effect.fail(new WizardStepError({
+				step: 'read-availability',
+				message: `Invalid target month: ${targetMonth}`,
+			}));
+		}
 
 		// Wait for either the legacy react-calendar grid or the current direct
 		// time-list view. Acuity may skip the grid when the service URL resolves
 		// directly to upcoming times.
 		const directTimeSelector = Selectors.timeSlot[0];
-		const availabilitySelector = `${Selectors.calendarDay.join(', ')}, ${Selectors.timeSlot.join(', ')}`;
-		yield* Effect.tryPromise({
-			try: () => page.waitForSelector(availabilitySelector, { timeout: 10000 }),
-			catch: () => null,
-		}).pipe(Effect.ignore);
 
 		const tileSelector = Selectors.calendarDay[0]; // .react-calendar__tile
 		let dates = yield* readEnabledCalendarDates(page, tileSelector);
@@ -491,40 +528,54 @@ export const readSlotsViaUrl = (
 
 		const navigationStartedAt = Date.now();
 		yield* navigateToServiceCalendar(page, url, config.timeout, 'read-slots');
-		yield* navigateToTargetMonth(page, targetMonth, 'read-slots');
+		const surface = yield* waitForAvailabilitySurface(
+			page,
+			config.timeout,
+			'read-slots',
+		);
+		if (surface === 'calendar') {
+			yield* navigateToTargetMonth(page, targetMonth, 'read-slots');
+		} else if (!parseYearMonthKey(targetMonth)) {
+			return yield* Effect.fail(new WizardStepError({
+				step: 'read-slots',
+				message: `Invalid target month: ${targetMonth}`,
+			}));
+		}
 		navigationMs = Date.now() - navigationStartedAt;
 
 		// Click the target date on the calendar. Disabled dates are a valid
 		// "no availability" result, not a scrape failure.
 		const tileSelector = Selectors.calendarDay[0];
-		const clickedTargetDate = yield* Effect.tryPromise({
-			try: async () => {
-				const calendarReadyStartedAt = Date.now();
-				await page.waitForSelector(tileSelector, { timeout: 10000 }).catch(() => {});
-				calendarReadyMs = Date.now() - calendarReadyStartedAt;
+		let clickedTargetDate = false;
+		if (surface === 'calendar') {
+			clickedTargetDate = yield* Effect.tryPromise({
+				try: async () => {
+					const calendarReadyStartedAt = Date.now();
+					await page.waitForSelector(tileSelector, { timeout: 10000 }).catch(() => {});
+					calendarReadyMs = Date.now() - calendarReadyStartedAt;
 
-				const dateSelectStartedAt = Date.now();
-				const tiles = await page.$$(tileSelector);
-				calendarTileCount = tiles.length;
-				for (const tile of tiles) {
-					const abbr = await tile.$('abbr');
-					const label = await abbr?.getAttribute('aria-label');
-					if (label) {
-						const d = new Date(label);
-						if (d.toISOString().slice(0, 10) === date) {
-							matchedDateFound = true;
-							const disabled = await tile.evaluate((el) => {
-								const button = el as HTMLButtonElement;
-								return (
-									button.disabled ||
-									button.getAttribute('aria-disabled') === 'true' ||
-									button.classList.contains('react-calendar__tile--disabled')
-								);
-							});
-							if (disabled) {
-								dateSelectMs = Date.now() - dateSelectStartedAt;
-								return false;
-							}
+					const dateSelectStartedAt = Date.now();
+					const tiles = await page.$$(tileSelector);
+					calendarTileCount = tiles.length;
+					for (const tile of tiles) {
+						const abbr = await tile.$('abbr');
+						const label = await abbr?.getAttribute('aria-label');
+						if (label) {
+							const d = new Date(label);
+							if (d.toISOString().slice(0, 10) === date) {
+								matchedDateFound = true;
+								const disabled = await tile.evaluate((el) => {
+									const button = el as HTMLButtonElement;
+									return (
+										button.disabled ||
+										button.getAttribute('aria-disabled') === 'true' ||
+										button.classList.contains('react-calendar__tile--disabled')
+									);
+								});
+								if (disabled) {
+									dateSelectMs = Date.now() - dateSelectStartedAt;
+									return false;
+								}
 								await tile.click({ timeout: Math.min(config.timeout, 5000) });
 								dateSelectMs = Date.now() - dateSelectStartedAt;
 
@@ -533,13 +584,14 @@ export const readSlotsViaUrl = (
 								postClickSettleMs = Date.now() - settleStartedAt;
 								return true;
 							}
+						}
 					}
-				}
-				dateSelectMs = Date.now() - dateSelectStartedAt;
-				return false;
-			},
-			catch: (e) => new WizardStepError({ step: 'read-slots', message: `Date click failed: ${e}` }),
-		});
+					dateSelectMs = Date.now() - dateSelectStartedAt;
+					return false;
+				},
+				catch: (e) => new WizardStepError({ step: 'read-slots', message: `Date click failed: ${e}` }),
+			});
+		}
 
 		if (!clickedTargetDate) {
 			const directSlotReadStartedAt = Date.now();
