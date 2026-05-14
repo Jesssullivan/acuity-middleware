@@ -11,6 +11,7 @@ import {
 	parseTimeSelectionDates,
 	parseTimeSelectionSlots,
 	readDatesViaUrl,
+	readSlotsViaUrl,
 	type TimeSelectionEntry,
 	urlReadNetworkIdleTimeoutMs,
 } from './read-via-url.js';
@@ -122,6 +123,12 @@ const makeUrlDateReadPage = (
 			if (selector.includes('next-button')) return navHandle('next');
 			return {};
 		}),
+		$: vi.fn(async (selector: string) => (
+			selector.includes('monthly-calendar') ||
+			selector.includes('react-calendar')
+				? {}
+				: null
+		)),
 		waitForTimeout: vi.fn(async () => undefined),
 		waitForFunction: vi.fn(async () => {
 			onWaitForFunction?.();
@@ -143,10 +150,60 @@ const makeUrlDateReadPage = (
 	};
 };
 
+const makeDirectTimeListPage = (entries: TimeSelectionEntry[]) => {
+	const gotoUrls: string[] = [];
+
+	const page = {
+		goto: vi.fn(async (url: string) => {
+			gotoUrls.push(url);
+		}),
+		waitForLoadState: vi.fn(async () => undefined),
+		waitForSelector: vi.fn(async () => ({})),
+		$: vi.fn(async (selector: string) => (
+			selector.includes('time-selection') || selector.includes('time-slot')
+				? {}
+				: null
+		)),
+		$$: vi.fn(async () => []),
+		waitForTimeout: vi.fn(async () => undefined),
+		waitForFunction: vi.fn(async () => undefined),
+		$eval: vi.fn(async () => null),
+		evaluate: vi.fn(async (_fn: unknown, selector?: string) => {
+			if (typeof selector === 'string' && selector.includes('time-selection')) {
+				return entries;
+			}
+			if (typeof selector === 'string') return [];
+			return false;
+		}),
+	} as unknown as Page;
+
+	return {
+		page,
+		gotoUrls,
+	};
+};
+
 const runDateRead = (page: Page, targetMonth?: string) =>
 	Effect.runPromise(
 		Effect.scoped(
 			readDatesViaUrl('53178494', targetMonth).pipe(
+				Effect.provideService(BrowserService, {
+					acquirePage: Effect.succeed(page),
+					screenshot: () => Effect.succeed(Buffer.from('')),
+					config: {
+						...defaultBrowserConfig,
+						baseUrl: 'https://MassageIthaca.as.me',
+						timeout: 1_000,
+					},
+				}),
+			),
+		),
+	);
+
+const runSlotRead = (page: Page, date: string) =>
+	Effect.runPromise(
+		Effect.scoped(
+			readSlotsViaUrl('53178494', date).pipe(
 				Effect.provideService(BrowserService, {
 					acquirePage: Effect.succeed(page),
 					screenshot: () => Effect.succeed(Buffer.from('')),
@@ -240,5 +297,43 @@ describe('readDatesViaUrl DOM behavior', () => {
 		expect(fake.gotoUrls[0]).toBe(
 			'https://massageithaca.as.me/?appointmentType=53178494',
 		);
+	});
+
+	it('does not require a calendar before reading the direct Acuity time list', async () => {
+		const fake = makeDirectTimeListPage([
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday Jun 7',
+				disabled: false,
+			},
+		]);
+
+		const dates = await runDateRead(fake.page, '2026-06');
+
+		expect(dates).toEqual([{ date: '2026-06-07', slots: 1 }]);
+		expect(fake.gotoUrls[0]).toBe(
+			'https://massageithaca.as.me/?appointmentType=53178494',
+		);
+		expect(fake.page.$eval).not.toHaveBeenCalled();
+	});
+
+	it('reads slots from the direct Acuity time list without a calendar', async () => {
+		const fake = makeDirectTimeListPage([
+			{
+				text: '10:00 AM1 spot left',
+				ariaLabel: '10:00 AM, 1 spot left, Sunday Jun 7',
+				disabled: false,
+			},
+		]);
+
+		const slots = await runSlotRead(fake.page, '2026-06-07');
+
+		expect(slots).toEqual([
+			{ datetime: '2026-06-07T10:00:00', available: true },
+		]);
+		expect(fake.gotoUrls[0]).toBe(
+			'https://massageithaca.as.me/?appointmentType=53178494&date=2026-06-07',
+		);
+		expect(fake.page.$$).not.toHaveBeenCalled();
 	});
 });
